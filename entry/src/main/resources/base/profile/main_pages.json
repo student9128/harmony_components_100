@@ -1,6 +1,7 @@
 {
   "src": [
     "pages/Index",
-    "pages/PatternLockPage"
+    "pages/PatternLockPage",
+    "pages/WeatherStickyDemo"
   ]
 }

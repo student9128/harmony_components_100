@@ -86,11 +86,16 @@ struct Index {
 
   build() {
     Column() {
-      Row() {
+      Row({ space: 8 }) {
         Button('九宫格图案解锁 Demo')
           .fontSize(14)
           .onClick(() => {
             router.pushUrl({ url: 'pages/PatternLockPage' })
+          })
+        Button('iOS 天气卡片滚动')
+          .fontSize(14)
+          .onClick(() => {
+            router.pushUrl({ url: 'pages/WeatherStickyDemo' })
           })
       }
       .width('100%')
