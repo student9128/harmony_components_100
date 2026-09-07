@@ -10,9 +10,8 @@ const MIN_POINTS: number = 4
  * 路径以 "0,1,4,8" 形式存入 preferences，重启应用仍在（验证模式）。
  * 左上角「清除密码」可回到设置模式。
  */
-@Entry
 @ComponentV2
-struct PatternLockPage {
+export struct PatternLockPage {
   @Local style: PatternLockStyle = PatternLockStyle.RING
   @Local hint: string = '绘制解锁图案'
   @Local hasStored: boolean = false

@@ -211,9 +211,8 @@ struct StickySectionCard {
 function EmptyContent(): void {
 }
 
-@Entry
 @ComponentV2
-struct WeatherStickyDemo {
+export struct WeatherStickyDemo {
   /** 当前滚动总偏移量（vp） */
   @Local scrollY: number = 0
   @Local viewportH: number = 0
