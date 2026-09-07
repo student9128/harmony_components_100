@@ -21,6 +21,7 @@
         "startWindowIcon": "$media:startIcon",
         "startWindowBackground": "$color:start_window_background",
         "exported": true,
+        "backgroundModes": ["audioPlayback"],
         "skills": [
           {
             "entities": [
@@ -48,7 +49,8 @@
       }
     ],
     "requestPermissions": [
-      {"name": "ohos.permission.INTERNET"}
+      {"name": "ohos.permission.INTERNET"},
+      {"name": "ohos.permission.KEEP_BACKGROUND_RUNNING"}
     ]
   }
 }

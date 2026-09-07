@@ -1,9 +1,27 @@
 import { media } from '@kit.MediaKit'
 import { BusinessError } from '@kit.BasicServicesKit'
+import { common } from '@kit.AbilityKit'
 import { VideoProgressBar } from '../widget/VideoProgressBar'
+import { MediaSessionHelper, MediaSessionCommands } from '../media/MediaSessionHelper'
+import { BackgroundPlayHelper } from '../media/BackgroundPlayHelper'
+import { ScreenHelper } from '../media/ScreenHelper'
 
 const VIDEO_SRC: string =
   'https://sf1-cdn-tos.huoshanstatic.com/obj/media-fe/xgplayer_doc_video/mp4/xgplayer-demo-360p.mp4'
+/** 显示在播控中心 / 锁屏卡片上的标题 */
+const VIDEO_TITLE: string = '组件 Demo 视频'
+
+/** 倍速档位：PlaybackSpeed 枚举 / 界面文案 / 上报给 AVSession 的数值 */
+const SPEED_LIST: media.PlaybackSpeed[] = [
+  media.PlaybackSpeed.SPEED_FORWARD_0_75_X,
+  media.PlaybackSpeed.SPEED_FORWARD_1_00_X,
+  media.PlaybackSpeed.SPEED_FORWARD_1_25_X,
+  media.PlaybackSpeed.SPEED_FORWARD_1_50_X,
+  media.PlaybackSpeed.SPEED_FORWARD_2_00_X
+]
+const SPEED_LABELS: string[] = ['0.75x', '1.00x', '1.25x', '1.50x', '2.00x']
+const SPEED_VALUES: number[] = [0.75, 1.0, 1.25, 1.5, 2.0]
+const DEFAULT_SPEED_INDEX: number = 1
 
 function formatTime(timeMs: number): string {
   const totalSeconds: number = Math.max(0, Math.floor(timeMs / 1000))
@@ -46,7 +64,13 @@ class VideoSurfaceController extends XComponentController {
 
 /**
  * 视频播放器 Demo：AVPlayer + XComponent + 自绘带缓存进度的进度条。
- * 由 pages/Index.ets 的 Navigation 路由表承载（不是 @Entry 页面）。
+ *
+ * 【播控接入】
+ *  - MediaSessionHelper：AVSession，负责播控中心与锁屏卡片；
+ *  - BackgroundPlayHelper：AUDIO_PLAYBACK 长时任务，负责退后台 / 锁屏后仍能播；
+ *  - ScreenHelper：全屏 + 旋转锁定。
+ *
+ * 【控制栏】上层：左(当前/总时长) 中(播放暂停) 右(倍速/旋转锁/全屏)；下层：进度条。
  */
 @ComponentV2
 export struct VideoDemoPage {
@@ -55,6 +79,9 @@ export struct VideoDemoPage {
   @Local bufferTime: number = 0
   @Local isPlaying: boolean = false
   @Local seeking: boolean = false
+  @Local speedIndex: number = DEFAULT_SPEED_INDEX
+  @Local isFullScreen: boolean = false
+  @Local isLocked: boolean = false
 
   private avPlayer: media.AVPlayer | undefined = undefined
   /** createAVPlayer 是异步的，这个标志用于防止它被重复调用（否则会创建出多个播放器） */
@@ -62,8 +89,16 @@ export struct VideoDemoPage {
   private surfaceId: string = ''
   private xComponentController: VideoSurfaceController = new VideoSurfaceController()
   private rebindTimerId: number = -1
+  /** setSpeed 只能在 prepared/playing/paused/completed 调用，未就绪时先记下来 */
+  private pendingSpeed: media.PlaybackSpeed | undefined = undefined
+
+  private mediaSession: MediaSessionHelper = new MediaSessionHelper()
+  private backgroundPlay: BackgroundPlayHelper = new BackgroundPlayHelper()
+  private screen: ScreenHelper = new ScreenHelper()
+  private uiContext: common.UIAbilityContext | undefined = undefined
 
   aboutToAppear(): void {
+    this.uiContext = getContext(this) as common.UIAbilityContext
     this.xComponentController.onCreated = (surfaceId: string): void => {
       this.onSurfaceCreate(surfaceId)
     }
@@ -73,12 +108,37 @@ export struct VideoDemoPage {
     this.xComponentController.onDestroyed = (): void => {
       this.surfaceId = ''
     }
+    const commands: MediaSessionCommands = {
+      onPlay: (): void => {
+        this.play()
+      },
+      onPause: (): void => {
+        this.pause()
+      },
+      onStop: (): void => {
+        this.pause()
+      },
+      onSeek: (timeMs: number): void => {
+        this.seekTo(timeMs)
+      },
+      onSetSpeed: (speed: number): void => {
+        this.applySystemSpeed(speed)
+      }
+    }
+    if (this.uiContext) {
+      void this.mediaSession.create(this.uiContext, VIDEO_TITLE, commands)
+    }
   }
 
   aboutToDisappear(): void {
     if (this.rebindTimerId >= 0) {
       clearTimeout(this.rebindTimerId)
       this.rebindTimerId = -1
+    }
+    void this.backgroundPlay.stop()
+    void this.mediaSession.destroy()
+    if (this.uiContext) {
+      void this.screen.restore(this.uiContext) // 必须恢复，否则整个应用保持全屏横屏
     }
     if (this.avPlayer) {
       this.avPlayer.release()
@@ -88,84 +148,155 @@ export struct VideoDemoPage {
 
   build() {
     Column() {
-      Stack({ alignContent: Alignment.Center }) {
-        XComponent({
-          id: 'videoSurface',
-          type: XComponentType.SURFACE,
-          controller: this.xComponentController
-        })
-          .width('100%')
-          .height('100%')
-
-        if (!this.isPlaying) {
-          Stack() {
-            Circle()
-              .width(56)
-              .height(56)
-              .fill('#80F51F1F')
-            Text('播放▶')
-              .fontSize(12)
-              .fontColor('#FFFFFF')
-          }
-          .width(56)
-          .height(56)
-          .onClick(() => {
-            this.avPlayer?.play()
-          })
+      if (this.isFullScreen) {
+        Column() {
+          this.videoArea()
         }
-      }
-      .width('100%')
-      .aspectRatio(16 / 9)
-      .onClick(() => {
-        if (this.isPlaying) {
-          this.avPlayer?.pause()
+        .width('100%')
+        .layoutWeight(1)
+      } else {
+        Column() {
+          this.videoArea()
         }
-      })
-
-      Row() {
-        Text(formatTime(this.currentTime))
-          .fontSize(12)
-          .fontColor('#CCFFFFFF')
-
-        VideoProgressBar({
-          progress: this.playProgress,
-          bufferProgress: this.cachedProgress,
-          barHeight: 3,
-          activeBarHeight: 6,
-          thumbSize: 12,
-          trackColor: '#4DFFFFFF',
-          bufferColor: '#998E6F23',
-          progressColor: '#1747E5',
-          onSeekStart: (progress: number) => {
-            this.seeking = true
-            this.currentTime = progress * this.duration
-          },
-          onSeeking: (progress: number) => {
-            this.currentTime = progress * this.duration
-          },
-          onSeekEnd: (progress: number) => {
-            this.avPlayer?.seek(Math.floor(progress * this.duration), media.SeekMode.SEEK_PREV_SYNC)
-            this.seeking = false
-          }
-        })
-          .layoutWeight(1)
-          .margin({ left: 8, right: 8 })
-
-        Text(formatTime(this.duration))
-          .fontSize(12)
-          .fontColor('#CCFFFFFF')
-
-        // 调试用：确认是“缓冲数据为 0”还是“进度条没画出来”，验证完可删
-        Text(`${Math.round(this.cachedProgress * 100)}%`)
-          .fontSize(10)
-          .fontColor('#99FFFFFF')
+        .width('100%')
+        .aspectRatio(16 / 9)
       }
-      .width('100%')
-      .padding({ left: 12, right: 12, top: 8, bottom: 8 })
-      .backgroundColor('#000000')
+
+      this.controlBar()
     }
     .height('100%')
     .width('100%')
+    .backgroundColor('#000000')
+  }
+
+  /** 视频画面层（全屏与非全屏共用，外层容器决定它的高度） */
+  @Builder
+  videoArea(): void {
+    Stack({ alignContent: Alignment.Center }) {
+      XComponent({
+        id: 'videoSurface',
+        type: XComponentType.SURFACE,
+        controller: this.xComponentController
+      })
+        .width('100%')
+        .height('100%')
+
+      if (!this.isPlaying) {
+        Stack() {
+          Circle()
+            .width(56)
+            .height(56)
+            .fill('#80F51F1F')
+          Image($r('app.media.ic_play'))
+            .width(30)
+            .height(30)
+            // SVG 自带 fill 是 #1F1F1F，必须改色，否则在黑底上看不见
+            .fillColor('#FFFFFF')
+        }
+        .width(56)
+        .height(56)
+        .onClick(() => {
+          this.play()
+        })
+      }
+    }
+    .width('100%')
+    .height('100%')
+    .backgroundColor('#000000')
+    .onClick(() => {
+      this.togglePlay()
+    })
+  }
+
+  /** 控制栏：上层 左时长 / 中播放暂停 / 右(倍速·旋转锁·全屏)，下层进度条 */
+  @Builder
+  controlBar(): void {
+    Column({ space: 6 }) {
+      Row() {
+        Text(`${formatTime(this.currentTime)} / ${formatTime(this.duration)}`)
+          .fontSize(12)
+          .fontColor('#CCFFFFFF')
+          .maxLines(1)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+          .layoutWeight(1)
+
+        Row() {
+          Image(this.isPlaying ? $r('app.media.ic_pause') : $r('app.media.ic_play'))
+            .width(22)
+            .height(22)
+            .fillColor('#FFFFFF')
+        }
+        .width(44)
+        .height(44)
+        .borderRadius(22)
+        .backgroundColor('#33FFFFFF')
+        .justifyContent(FlexAlign.Center)
+        .onClick(() => {
+          this.togglePlay()
+        })
+
+        Row({ space: 14 }) {
+          Row({ space: 2 }) {
+            Image($r('app.media.ic_speed'))
+              .width(18)
+              .height(18)
+              .fillColor('#FFFFFF')
+            Text(SPEED_LABELS[this.speedIndex])
+              .fontSize(12)
+              .fontColor('#FFFFFF')
+          }
+          .onClick(() => {
+            this.toggleSpeed()
+          })
+
+          Image(this.isLocked ? $r('app.media.ic_lock') : $r('app.media.ic_unlock'))
+            .width(20)
+            .height(20)
+            .fillColor(this.isLocked ? '#FFD60A' : '#FFFFFF')
+            .onClick(() => {
+              this.toggleLock()
+            })
+
+          Image(this.isFullScreen ? $r('app.media.ic_fullscreen_exit') : $r('app.media.ic_fullscreen'))
+            .width(22)
+            .height(22)
+            .fillColor('#FFFFFF')
+            .onClick(() => {
+              this.toggleFullScreen()
+            })
+        }
+        .layoutWeight(1)
+        .height(44)
+        .justifyContent(FlexAlign.End)
+      }
+      .width('100%')
+      .height(48)
+
+      VideoProgressBar({
+        progress: this.playProgress,
+        bufferProgress: this.cachedProgress,
+        barHeight: 3,
+        activeBarHeight: 6,
+        thumbSize: 12,
+        trackColor: '#4DFFFFFF',
+        bufferColor: '#998E6F23',
+        progressColor: '#1747E5',
+        onSeekStart: (progress: number) => {
+          this.seeking = true
+          this.currentTime = progress * this.duration
+        },
+        onSeeking: (progress: number) => {
+          this.currentTime = progress * this.duration
+        },
+        onSeekEnd: (progress: number) => {
+          this.seekTo(Math.floor(progress * this.duration))
+        }
+      })
+        .width('100%')
+    }
+    .width('100%')
+    .padding({ left: 12, right: 12, top: 4, bottom: 12 })
+    .backgroundColor('#000000')
   }
 
   private get playProgress(): number {
@@ -174,6 +305,104 @@ export struct VideoDemoPage {
 
   private get cachedProgress(): number {
     return this.duration > 0 ? this.bufferTime / this.duration : 0
+  }
+
+  /** 播放 / 暂停统一入口：同时同步给 AVSession 与后台任务 */
+  private play(): void {
+    if (!this.avPlayer) {
+      return
+    }
+    this.avPlayer.play()
+    if (this.uiContext) {
+      void this.backgroundPlay.start(this.uiContext)
+    }
+  }
+
+  private pause(): void {
+    if (!this.avPlayer) {
+      return
+    }
+    this.avPlayer.pause()
+    void this.backgroundPlay.stop()
+  }
+
+  private togglePlay(): void {
+    if (this.isPlaying) {
+      this.pause()
+    } else {
+      this.play()
+    }
+  }
+
+  private toggleSpeed(): void {
+    this.speedIndex = (this.speedIndex + 1) % SPEED_LIST.length
+    this.applySpeed(SPEED_LIST[this.speedIndex])
+  }
+
+  private applySpeed(speed: media.PlaybackSpeed): void {
+    if (!this.avPlayer) {
+      this.pendingSpeed = speed // 播放器还没创建，等 prepared 后再应用
+      return
+    }
+    try {
+      this.avPlayer.setSpeed(speed)
+    } catch (error) {
+      // 尚未进入 prepared/playing/paused/completed，此时调用会抛错
+      this.pendingSpeed = speed
+    }
+    this.syncSessionState()
+  }
+
+  /** 播控中心下发倍速（任意数值）→ 匹配到最接近的档位 */
+  private applySystemSpeed(speed: number): void {
+    let nearest: number = 0
+    let minDiff: number = Number.MAX_VALUE
+    for (let i: number = 0; i < SPEED_VALUES.length; i++) {
+      const diff: number = Math.abs(SPEED_VALUES[i] - speed)
+      if (diff < minDiff) {
+        minDiff = diff
+        nearest = i
+      }
+    }
+    this.speedIndex = nearest
+    this.applySpeed(SPEED_LIST[nearest])
+  }
+
+  private toggleFullScreen(): void {
+    if (this.isLocked) {
+      return // 已锁旋转：不再自动切方向，避免和用户意图打架
+    }
+    this.isFullScreen = !this.isFullScreen
+    if (this.uiContext) {
+      void this.screen.setFullScreen(this.uiContext, this.isFullScreen)
+    }
+  }
+
+  private toggleLock(): void {
+    this.isLocked = !this.isLocked
+    if (this.uiContext) {
+      void this.screen.setLocked(this.uiContext, this.isLocked)
+    }
+  }
+
+  private seekTo(timeMs: number): void {
+    this.currentTime = timeMs
+    this.seeking = false
+    if (this.avPlayer) {
+      this.avPlayer.seek(Math.floor(timeMs), media.SeekMode.SEEK_PREV_SYNC)
+    }
+    this.syncSessionState()
+  }
+
+  /** 把当前状态一次性同步给播控中心 / 锁屏卡片 */
+  private syncSessionState(): void {
+    void this.mediaSession.setPlaybackState(
+      this.isPlaying,
+      this.currentTime,
+      this.duration,
+      SPEED_VALUES[this.speedIndex],
+      this.bufferTime
+    )
   }
 
   private onSurfaceCreate(surfaceId: string): void {
@@ -254,17 +483,29 @@ export struct VideoDemoPage {
           }
           break
         }
-        case 'prepared':
+        case 'prepared': {
+          // 倍速只能在 prepared 之后设置，pendingSpeed 在这里补上
+          if (this.pendingSpeed !== undefined) {
+            try {
+              player.setSpeed(this.pendingSpeed)
+            } catch (error) {
+              console.error('setSpeed 失败')
+            }
+            this.pendingSpeed = undefined
+          }
           player.play()
           break
+        }
         case 'playing':
           this.isPlaying = true
           this.scheduleSurfaceRebind() // 兜底：首绑失败时补一次
+          this.syncSessionState()
           break
         case 'paused':
         case 'completed':
         case 'stopped':
           this.isPlaying = false
+          this.syncSessionState()
           break
         default:
           break
@@ -273,12 +514,16 @@ export struct VideoDemoPage {
 
     player.on('durationUpdate', (duration: number) => {
       this.duration = duration
+      // 总时长也要告诉播控中心，否则进度条没有终点
+      void this.mediaSession.setMeta(VIDEO_TITLE, duration)
+      this.syncSessionState()
     })
 
     // 拖动过程中不接收播放器回传的进度，避免把预览值冲掉
     player.on('timeUpdate', (time: number) => {
       if (!this.seeking) {
         this.currentTime = time
+        this.syncSessionState()
       }
     })
 
@@ -288,7 +533,6 @@ export struct VideoDemoPage {
      * - BUFFERING_PERCENT：value 为缓冲百分比（0~100）
      */
     player.on('bufferingUpdate', (infoType: media.BufferingInfoType, value: number) => {
-      console.info(`bufferingUpdate, infoType: ${infoType}, value: ${value}, duration: ${this.duration}`)
       switch (infoType) {
         case media.BufferingInfoType.CACHED_DURATION:
           this.bufferTime = value
