@@ -23,6 +23,9 @@ const SPEED_LABELS: string[] = ['0.75x', '1.00x', '1.25x', '1.50x', '2.00x']
 const SPEED_VALUES: number[] = [0.75, 1.0, 1.25, 1.5, 2.0]
 const DEFAULT_SPEED_INDEX: number = 1
 
+/** 播放中控件自动隐藏的延时 */
+const CONTROLS_HIDE_DELAY_MS: number = 5000
+
 function formatTime(timeMs: number): string {
   const totalSeconds: number = Math.max(0, Math.floor(timeMs / 1000))
   const minute: number = Math.floor(totalSeconds / 60)
@@ -70,7 +73,12 @@ class VideoSurfaceController extends XComponentController {
  *  - BackgroundPlayHelper：AUDIO_PLAYBACK 长时任务，负责退后台 / 锁屏后仍能播；
  *  - ScreenHelper：全屏 + 旋转锁定。
  *
- * 【控制栏】上层：左(当前/总时长) 中(播放暂停) 右(倍速/旋转锁/全屏)；下层：进度条。
+ * 【控件布局】全部叠加在画面上（Stack 分层）：
+ *  - 中央：播放 / 暂停；
+ *  - 右侧垂直居中：旋转锁；
+ *  - 贴底：时长 + 倍速 + 全屏 + 进度条。
+ *
+ * 【显隐交互】点击画面切换显隐；播放开始 5 秒后自动隐藏；暂停时常驻不隐藏。
  */
 @ComponentV2
 export struct VideoDemoPage {
@@ -82,6 +90,7 @@ export struct VideoDemoPage {
   @Local speedIndex: number = DEFAULT_SPEED_INDEX
   @Local isFullScreen: boolean = false
   @Local isLocked: boolean = false
+  @Local controlsVisible: boolean = true
 
   private avPlayer: media.AVPlayer | undefined = undefined
   /** createAVPlayer 是异步的，这个标志用于防止它被重复调用（否则会创建出多个播放器） */
@@ -91,6 +100,9 @@ export struct VideoDemoPage {
   private rebindTimerId: number = -1
   /** setSpeed 只能在 prepared/playing/paused/completed 调用，未就绪时先记下来 */
   private pendingSpeed: media.PlaybackSpeed | undefined = undefined
+  private controlsHideTimerId: number = -1
+  /** 拖动进度条前的播放状态：用于松手后恢复（拖 suspend、松手 resume） */
+  private playBeforeSeek: boolean = false
 
   private mediaSession: MediaSessionHelper = new MediaSessionHelper()
   private backgroundPlay: BackgroundPlayHelper = new BackgroundPlayHelper()
@@ -131,6 +143,7 @@ export struct VideoDemoPage {
   }
 
   aboutToDisappear(): void {
+    this.cancelControlsHideTimer()
     if (this.rebindTimerId >= 0) {
       clearTimeout(this.rebindTimerId)
       this.rebindTimerId = -1
@@ -150,29 +163,42 @@ export struct VideoDemoPage {
     Column() {
       if (this.isFullScreen) {
         Column() {
-          this.videoArea()
+          this.playerArea()
         }
         .width('100%')
         .layoutWeight(1)
       } else {
         Column() {
-          this.videoArea()
+          this.playerArea()
         }
         .width('100%')
         .aspectRatio(16 / 9)
       }
-
-      this.controlBar()
     }
     .height('100%')
     .width('100%')
     .backgroundColor('#000000')
   }
 
-  /** 视频画面层（全屏与非全屏共用，外层容器决定它的高度） */
+  /**
+   * 播放器区域：画面 + 控件全部叠在这里（一体化播放器）。
+   *
+   * 【层级与点击】
+   *  1. XComponent（画面）
+   *  2. 点击层（铺满透明，onClick 切换控件显隐）
+   *  3. 中央播放暂停 / 右侧锁 / 贴底控制栏
+   *
+   * ⚠️ Stack 中节点重叠时，「默认只对显示在最上层的节点做触摸测试」——
+   * 任何铺满 100% 的控件容器都会挡住它下面的兄弟节点（踩过：锁和播放按钮因此点不动）。
+   * 所以这里【不使用铺满容器】，一律用 position + markAnchor 绝对定位，
+   * 每个控件只占自己那一小块，其余区域落回点击层：
+   *   - 中央：position(50%,50%) + markAnchor(50%,50%)
+   *   - 右侧锁：position(100%,50%) + markAnchor(100%,50%) + translate 留右边距
+   *   - 贴底栏：position(0,100%) + markAnchor(0,100%)，高度只有内容那么高
+   */
   @Builder
-  videoArea(): void {
-    Stack({ alignContent: Alignment.Center }) {
+  playerArea(): void {
+    Stack() {
       XComponent({
         id: 'videoSurface',
         type: XComponentType.SURFACE,
@@ -181,123 +207,171 @@ export struct VideoDemoPage {
         .width('100%')
         .height('100%')
 
-      if (!this.isPlaying) {
+      // 点击层：点击画面 → 显示 / 隐藏控件
+      Column()
+        .width('100%')
+        .height('100%')
+        .onClick(() => {
+          this.toggleControls()
+        })
+
+      if (this.controlsVisible) {
+        // 右侧垂直居中：旋转锁（绝对定位，只占 40×40）
+        Row() {
+          Image(this.isLocked ? $r('app.media.ic_lock') : $r('app.media.ic_unlock'))
+            .width(22)
+            .height(22)
+            .fillColor(this.isLocked ? '#FFD60A' : '#FFFFFF')
+        }
+        .width(40)
+        .height(40)
+        .borderRadius(20)
+        .backgroundColor('#4D000000')
+        .justifyContent(FlexAlign.Center)
+        .position({ x: '100%', y: '50%' })
+        .markAnchor({ x: '100%', y: '50%' })
+        .translate({ x: -10 })
+        .onClick(() => {
+          this.toggleLock()
+          this.showControls()
+        })
+
+        // 中央：播放 / 暂停
         Stack() {
           Circle()
-            .width(56)
-            .height(56)
-            .fill('#80F51F1F')
-          Image($r('app.media.ic_play'))
+            .width(64)
+            .height(64)
+            .fill('#66000000')
+          Image(this.isPlaying ? $r('app.media.ic_pause') : $r('app.media.ic_play'))
             .width(30)
             .height(30)
-            // SVG 自带 fill 是 #1F1F1F，必须改色，否则在黑底上看不见
             .fillColor('#FFFFFF')
         }
-        .width(56)
-        .height(56)
+        .width(64)
+        .height(64)
+        .position({ x: '50%', y: '50%' })
+        .markAnchor({ x: '50%', y: '50%' })
         .onClick(() => {
-          this.play()
+          this.togglePlay()
         })
+
+        // 贴底：时长 / 倍速 / 全屏 / 进度条（高度只有内容那么高，不铺满）
+        Column({ space: 6 }) {
+          Row() {
+            Text(`${formatTime(this.currentTime)} / ${formatTime(this.duration)}`)
+              .fontSize(12)
+              .fontColor('#FFFFFF')
+              .maxLines(1)
+              .textOverflow({ overflow: TextOverflow.Ellipsis })
+              .layoutWeight(1)
+
+            Row({ space: 16 }) {
+              Row({ space: 2 }) {
+                Image($r('app.media.ic_speed'))
+                  .width(18)
+                  .height(18)
+                  .fillColor('#FFFFFF')
+                Text(SPEED_LABELS[this.speedIndex])
+                  .fontSize(12)
+                  .fontColor('#FFFFFF')
+              }
+              .onClick(() => {
+                this.toggleSpeed()
+                this.showControls()
+              })
+
+              Image(this.isFullScreen ? $r('app.media.ic_fullscreen_exit') : $r('app.media.ic_fullscreen'))
+                .width(20)
+                .height(20)
+                .fillColor('#FFFFFF')
+                .onClick(() => {
+                  this.toggleFullScreen()
+                  this.showControls()
+                })
+            }
+          }
+          .width('100%')
+
+          VideoProgressBar({
+            progress: this.playProgress,
+            bufferProgress: this.cachedProgress,
+            barHeight: 3,
+            activeBarHeight: 6,
+            thumbSize: 12,
+            trackColor: '#4DFFFFFF',
+            bufferColor: '#998E6F23',
+            progressColor: '#1747E5',
+            onSeekStart: (progress: number) => {
+              // 拖动期间先暂停：否则播放器回传的 timeUpdate 会把预览位置冲掉，进度来回跳
+              this.seeking = true
+              this.playBeforeSeek = this.isPlaying
+              this.currentTime = progress * this.duration
+              if (this.isPlaying) {
+                this.pause()
+              }
+              this.showControls()
+            },
+            onSeeking: (progress: number) => {
+              this.currentTime = progress * this.duration
+            },
+            onSeekEnd: (progress: number) => {
+              this.seekTo(Math.floor(progress * this.duration))
+              if (this.playBeforeSeek) {
+                this.play() // 松手后恢复成拖动前的播放状态
+              }
+              this.playBeforeSeek = false
+            }
+          })
+            .width('100%')
+        }
+        .width('100%')
+        .padding({ left: 12, right: 12, top: 6, bottom: 10 })
+        .backgroundColor('#B3000000')
+        .position({ x: 0, y: '100%' })
+        .markAnchor({ x: 0, y: '100%' })
       }
     }
     .width('100%')
     .height('100%')
     .backgroundColor('#000000')
-    .onClick(() => {
-      this.togglePlay()
-    })
   }
 
-  /** 控制栏：上层 左时长 / 中播放暂停 / 右(倍速·旋转锁·全屏)，下层进度条 */
-  @Builder
-  controlBar(): void {
-    Column({ space: 6 }) {
-      Row() {
-        Text(`${formatTime(this.currentTime)} / ${formatTime(this.duration)}`)
-          .fontSize(12)
-          .fontColor('#CCFFFFFF')
-          .maxLines(1)
-          .textOverflow({ overflow: TextOverflow.Ellipsis })
-          .layoutWeight(1)
+  // ---------- 控件显隐 ----------
 
-        Row() {
-          Image(this.isPlaying ? $r('app.media.ic_pause') : $r('app.media.ic_play'))
-            .width(22)
-            .height(22)
-            .fillColor('#FFFFFF')
-        }
-        .width(44)
-        .height(44)
-        .borderRadius(22)
-        .backgroundColor('#33FFFFFF')
-        .justifyContent(FlexAlign.Center)
-        .onClick(() => {
-          this.togglePlay()
-        })
+  /** 显示控件；播放中则重置 5 秒倒计时，暂停/未播放时常驻 */
+  private showControls(): void {
+    this.controlsVisible = true
+    this.scheduleControlsHide()
+  }
 
-        Row({ space: 14 }) {
-          Row({ space: 2 }) {
-            Image($r('app.media.ic_speed'))
-              .width(18)
-              .height(18)
-              .fillColor('#FFFFFF')
-            Text(SPEED_LABELS[this.speedIndex])
-              .fontSize(12)
-              .fontColor('#FFFFFF')
-          }
-          .onClick(() => {
-            this.toggleSpeed()
-          })
-
-          Image(this.isLocked ? $r('app.media.ic_lock') : $r('app.media.ic_unlock'))
-            .width(20)
-            .height(20)
-            .fillColor(this.isLocked ? '#FFD60A' : '#FFFFFF')
-            .onClick(() => {
-              this.toggleLock()
-            })
-
-          Image(this.isFullScreen ? $r('app.media.ic_fullscreen_exit') : $r('app.media.ic_fullscreen'))
-            .width(22)
-            .height(22)
-            .fillColor('#FFFFFF')
-            .onClick(() => {
-              this.toggleFullScreen()
-            })
-        }
-        .layoutWeight(1)
-        .height(44)
-        .justifyContent(FlexAlign.End)
-      }
-      .width('100%')
-      .height(48)
-
-      VideoProgressBar({
-        progress: this.playProgress,
-        bufferProgress: this.cachedProgress,
-        barHeight: 3,
-        activeBarHeight: 6,
-        thumbSize: 12,
-        trackColor: '#4DFFFFFF',
-        bufferColor: '#998E6F23',
-        progressColor: '#1747E5',
-        onSeekStart: (progress: number) => {
-          this.seeking = true
-          this.currentTime = progress * this.duration
-        },
-        onSeeking: (progress: number) => {
-          this.currentTime = progress * this.duration
-        },
-        onSeekEnd: (progress: number) => {
-          this.seekTo(Math.floor(progress * this.duration))
-        }
-      })
-        .width('100%')
+  private scheduleControlsHide(): void {
+    this.cancelControlsHideTimer()
+    if (!this.isPlaying) {
+      return // 暂停 / 未播放时不自动隐藏
     }
-    .width('100%')
-    .padding({ left: 12, right: 12, top: 4, bottom: 12 })
-    .backgroundColor('#000000')
+    this.controlsHideTimerId = setTimeout((): void => {
+      this.controlsHideTimerId = -1
+      this.controlsVisible = false
+    }, CONTROLS_HIDE_DELAY_MS)
   }
+
+  private cancelControlsHideTimer(): void {
+    if (this.controlsHideTimerId >= 0) {
+      clearTimeout(this.controlsHideTimerId)
+      this.controlsHideTimerId = -1
+    }
+  }
+
+  private toggleControls(): void {
+    if (this.controlsVisible) {
+      this.controlsVisible = false
+      this.cancelControlsHideTimer()
+    } else {
+      this.showControls()
+    }
+  }
+
+  // ---------- 播放控制 ----------
 
   private get playProgress(): number {
     return this.duration > 0 ? this.currentTime / this.duration : 0
@@ -389,8 +463,11 @@ export struct VideoDemoPage {
     this.currentTime = timeMs
     this.seeking = false
     if (this.avPlayer) {
-      this.avPlayer.seek(Math.floor(timeMs), media.SeekMode.SEEK_PREV_SYNC)
+      // SEEK_PREV_SYNC 会跳到【上一个关键帧】，拖到 1:24 可能停在 1:20；
+      // 精准跳转必须用 SEEK_CLOSEST（跳到离目标最近的帧）
+      this.avPlayer.seek(Math.floor(timeMs), media.SeekMode.SEEK_CLOSEST)
     }
+    this.showControls()
     this.syncSessionState()
   }
 
@@ -498,6 +575,7 @@ export struct VideoDemoPage {
         }
         case 'playing':
           this.isPlaying = true
+          this.showControls() // 重新开始 5 秒倒计时
           this.scheduleSurfaceRebind() // 兜底：首绑失败时补一次
           this.syncSessionState()
           break
@@ -505,6 +583,7 @@ export struct VideoDemoPage {
         case 'completed':
         case 'stopped':
           this.isPlaying = false
+          this.showControls() // 暂停时常驻，不自动隐藏
           this.syncSessionState()
           break
         default:

@@ -71,6 +71,21 @@ export struct VideoProgressBar {
   @Local dragging: boolean = false
   @Local pressed: boolean = false
   @Local dragValue: number = 0
+  /**
+   * 首帧布局完成前【禁用】动画。
+   * 组件被重建时（典型场景：播放器控件隐藏后再显示），totalWidth 会从 0 变成真实宽度，
+   * 若此时动画已开启，就会看到进度条从 0「滑」到当前值。
+   * 因此必须等这一次宽度变化渲染完，再开启动画。
+   */
+  @Local progressAnimReady: boolean = false
+  private animReadyTimer: number = -1
+
+  aboutToDisappear(): void {
+    if (this.animReadyTimer >= 0) {
+      clearTimeout(this.animReadyTimer)
+      this.animReadyTimer = -1
+    }
+  }
 
   build() {
     Stack({ alignContent: Alignment.Center }) {
@@ -120,6 +135,13 @@ export struct VideoProgressBar {
     .onSizeChange((oldValue: SizeOptions, newValue: SizeOptions) => {
       const width: Length | undefined = newValue.width
       this.totalWidth = typeof width === 'number' ? width : 0
+      // 延后一帧再开启动画，保证「0 → 真实宽度」这一次变化是不带动画的
+      if (!this.progressAnimReady && this.totalWidth > 0 && this.animReadyTimer < 0) {
+        this.animReadyTimer = setTimeout((): void => {
+          this.animReadyTimer = -1
+          this.progressAnimReady = true
+        }, 32)
+      }
     })
     .onTouch((event: TouchEvent) => {
       this.handleTouch(event)
@@ -183,13 +205,13 @@ export struct VideoProgressBar {
     return this.thumbAlwaysShow || this.pressed || this.dragging
   }
 
-  /** 拖动中关闭动画，保证跟手；非拖动时用于平滑播放器回调的进度跳变 */
+  /** 拖动中关闭动画保证跟手；首帧未完成布局时也关闭，避免重建时从 0 滑入 */
   private get progressAnimationDuration(): number {
-    return this.smooth && !this.dragging ? 200 : 0
+    return this.smooth && !this.dragging && this.progressAnimReady ? 200 : 0
   }
 
   private get thumbAnimationDuration(): number {
-    return this.dragging ? 0 : 150
+    return !this.dragging && this.progressAnimReady ? 150 : 0
   }
 
   private handleTouch(event: TouchEvent): void {
